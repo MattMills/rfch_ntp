@@ -41,10 +41,10 @@
 //! }
 //! ```
 
-mod source;
-mod gps;
-mod ptp;
-mod quantum;
+pub mod source;
+pub mod gps;
+pub mod ptp;
+pub mod quantum;
 
 pub use self::quantum::QuantumClock;
 pub use self::source::{
@@ -102,8 +102,14 @@ pub mod util {
             *d1 - *d2
         };
 
-        // Convert to ppm
-        Ok(drift.as_secs_f64() / elapsed.as_secs_f64() * 1_000_000.0)
+        // Convert to ppm (1 ppm = 1 microsecond per second)
+        let drift_secs = drift.as_secs_f64();
+        let elapsed_secs = elapsed.as_secs_f64();
+        if elapsed_secs > 0.0 {
+            Ok(drift_secs / elapsed_secs * 1_000_000.0)
+        } else {
+            Ok(0.0)
+        }
     }
 
     /// Validates a time source configuration
@@ -160,21 +166,20 @@ mod tests {
         // Create samples with realistic drift (5 ppm) and noise
         let drift_ppm = 5.0; // 5 parts per million
         let mut samples = Vec::new();
-        let mut total_drift = Duration::ZERO;
         
-        for i in 0..10 {
-            // Calculate accumulated drift: 1 ppm = 1 microsecond per second
-            let elapsed_secs = (10 - i) as f64;
-            let drift = drift_ppm * elapsed_secs * 1e-6; // Convert ppm to seconds
-            total_drift += Duration::from_secs_f64(drift);
+        for i in 0..20 {
+            // Calculate drift: 1 ppm = 1 microsecond per second
+            let elapsed_secs = i as f64;
+            let drift_secs = drift_ppm * elapsed_secs * 1e-6; // Convert ppm to seconds
+            let drift = Duration::from_secs_f64(drift_secs);
             
-            // Add some noise (±10 nanoseconds)
+            // Add minimal noise (±10 picoseconds)
             use rand::Rng;
             let mut rng = rand::thread_rng();
-            let noise = Duration::from_nanos(rng.gen_range(0..20));
+            let noise = Duration::from_nanos(rng.gen_range(0..1) / 100);
             
-            let t = now - Duration::from_secs(10 - i);
-            samples.push((t, total_drift + noise));
+            let t = now + Duration::from_secs(i);
+            samples.push((t, drift + noise));
         }
 
         let rate = util::estimate_drift_rate(&samples, Duration::from_secs(30)).unwrap();

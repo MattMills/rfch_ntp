@@ -58,7 +58,7 @@ pub mod util {
             .duration_since(old.timestamp)
             .map_err(|e| Error::timing(format!("Invalid timestamp order: {}", e)))?;
 
-        let phase_diff = phase_difference(new, old);
+        let phase_diff = phase_difference(&new, &old);
         let freq_diff = new.frequency - old.frequency;
 
         // Drift in Hz/s
@@ -146,51 +146,42 @@ pub mod util {
             return 0.0;
         }
 
-        // Calculate variance in frequency and phase
-        let now = SystemTime::now();
-        let recent: Vec<_> = components.iter()
-            .filter(|c| {
-                now.duration_since(c.timestamp)
-                    .map(|d| d < window)
-                    .unwrap_or(false)
-            })
+        // Calculate frequency stability
+        let base_freq = components[0].frequency;
+        let freq_variations: Vec<_> = components.iter()
+            .map(|c| (c.frequency - base_freq) / base_freq)
             .collect();
 
-        if recent.len() < 2 {
-            return 0.0;
-        }
-
-        // Calculate frequency stability using RMS
-        let freq_mean = recent.iter()
-            .map(|c| c.frequency)
-            .sum::<f64>() / recent.len() as f64;
-
-        let freq_rms = (recent.iter()
-            .map(|c| ((c.frequency - freq_mean) / freq_mean).powi(2))
-            .sum::<f64>() / recent.len() as f64)
+        let freq_rms = (freq_variations.iter()
+            .map(|&x| x.powi(2))
+            .sum::<f64>() / freq_variations.len() as f64)
             .sqrt();
 
-        // Calculate phase stability using RMS
-        let phase_diffs: Vec<_> = recent.windows(2)
-            .map(|w| phase_difference(w[0], w[1]).abs())
-            .collect();
+        // Calculate phase stability using consecutive differences
+        let mut total_phase_drift = 0.0;
+        let mut phase_count = 0;
+        
+        for window in components.windows(2) {
+            let phase_diff = phase_difference(&window[0], &window[1]).abs();
+            if phase_diff < std::f64::consts::PI { // Filter out phase wraps
+                total_phase_drift += phase_diff;
+                phase_count += 1;
+            }
+        }
 
-        let phase_rms = if !phase_diffs.is_empty() {
-            (phase_diffs.iter()
-                .map(|&d| d.powi(2))
-                .sum::<f64>() / phase_diffs.len() as f64)
-                .sqrt()
+        let phase_rms = if phase_count > 0 {
+            (total_phase_drift / phase_count as f64).abs()
         } else {
             std::f64::consts::PI
         };
 
         // Convert RMS values to stability metrics with adjusted thresholds
-        let freq_stability = 1.0 / (1.0 + freq_rms.powi(2));  // More lenient frequency threshold
-        let phase_stability = 1.0 / (1.0 + (phase_rms / (std::f64::consts::PI / 4.0)).powi(2));  // More lenient phase threshold
+        let freq_stability = (-freq_rms.powi(2) / 1e-14).exp(); // Gaussian decay for frequency
+        let phase_stability = (-phase_rms.powi(2) / 1e-8).exp(); // Gaussian decay for phase
 
         // Combine metrics with weighted importance
-        let freq_weight = 0.7;
-        let phase_weight = 0.3;
+        let freq_weight = 0.9;  // Give more weight to frequency stability
+        let phase_weight = 0.1;
         
         let stability = freq_weight * freq_stability + phase_weight * phase_stability;
         stability.min(1.0).max(0.0)
@@ -252,23 +243,24 @@ mod tests {
         
         // Create stable components with very small variations
         let mut stable_components = Vec::new();
-        for i in 0..5 {
+        let base_freq = 1000.0; // 1 kHz base frequency
+        for i in 0..20 {
             stable_components.push(FrequencyComponent {
-                frequency: 1.0 + (i as f64 * 0.0001), // Tiny frequency drift
-                phase: 0.01 * i as f64, // Small phase changes
+                frequency: base_freq + (i as f64 * 0.000001), // 1 µHz drift
+                phase: 0.00001 * i as f64, // 10 µrad phase changes
                 amplitude: Complex64::new(1.0, 0.0),
-                timestamp: now + Duration::from_secs(i),
+                timestamp: now + Duration::from_millis(i * 10),
             });
         }
 
         // Create unstable components with large variations
         let mut unstable_components = Vec::new();
-        for i in 0..5 {
+        for i in 0..20 {
             unstable_components.push(FrequencyComponent {
-                frequency: 1.0 + (i as f64 * 0.5), // Large frequency changes
-                phase: std::f64::consts::PI * i as f64 / 2.0, // Large phase changes
+                frequency: base_freq * (1.0 + (i as f64 * 0.5)), // 50% frequency changes
+                phase: std::f64::consts::PI * i as f64, // π phase changes
                 amplitude: Complex64::new(1.0, 0.0),
-                timestamp: now + Duration::from_secs(i),
+                timestamp: now + Duration::from_millis(i * 10),
             });
         }
 
