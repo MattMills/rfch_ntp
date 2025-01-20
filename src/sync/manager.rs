@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 
 use crate::core::{Error, Result, FrequencyComponent, NodeId, Peer, Precision, Tier};
 use crate::protocol::message::Message;
-use super::frequency::FrequencyAnalyzer;
+use super::frequency::{FrequencyAnalyzer, PhaseSpace, WaveletDecomposition};
 
 /// Configuration for synchronization
 #[derive(Debug, Clone)]
@@ -52,12 +52,18 @@ pub struct SyncManager {
     config: SyncConfig,
     /// Channel for sending messages
     message_tx: mpsc::Sender<Message>,
-    /// Collected time samples
+    /// Collected time samples with timestamps
     samples: Vec<(SystemTime, f64)>,
     /// Current frequency components
     components: Vec<FrequencyComponent>,
+    /// Current phase space state
+    phase_space: Option<PhaseSpace>,
+    /// Current wavelet decomposition
+    wavelet_decomp: Option<WaveletDecomposition>,
     /// Known peers and their components
     peer_components: HashMap<NodeId, Vec<FrequencyComponent>>,
+    /// Peer phase coherence metrics
+    peer_coherence: HashMap<NodeId, f64>,
 }
 
 impl SyncManager {
@@ -77,7 +83,10 @@ impl SyncManager {
             message_tx,
             samples: Vec::new(),
             components: Vec::new(),
+            phase_space: None,
+            wavelet_decomp: None,
             peer_components: HashMap::new(),
+            peer_coherence: HashMap::new(),
         }
     }
 
@@ -105,40 +114,54 @@ impl SyncManager {
         self.prune_old_samples();
     }
 
-    /// Updates components from a peer
+    /// Updates components and coherence metrics from a peer
     pub fn update_peer_components(
         &mut self,
         peer_id: NodeId,
         components: Vec<FrequencyComponent>,
+        coherence: f64,
     ) {
-        self.peer_components.insert(peer_id, components);
+        self.peer_components.insert(peer_id.clone(), components);
+        self.peer_coherence.insert(peer_id, coherence);
     }
 
-    /// Performs frequency analysis on collected samples
+    /// Performs comprehensive signal analysis on collected samples
     pub async fn analyze(&mut self) -> Result<()> {
         // Ensure we have enough samples
         if self.samples.len() < self.config.min_samples {
             return Ok(());
         }
 
-        // Extract values in chronological order
-        let values: Vec<f64> = self.samples
-            .iter()
-            .map(|(_, v)| *v)
-            .collect();
+        // Extract values and timestamps
+        let (timestamps, values): (Vec<_>, Vec<_>) = self.samples.iter()
+            .cloned()
+            .unzip();
+
+        // Perform wavelet decomposition
+        self.wavelet_decomp = Some(self.analyzer.wavelet_transform(&values)?);
+
+        // Map to phase space
+        self.phase_space = Some(self.analyzer.phase_space_mapping(&values, &timestamps)?);
 
         // Perform frequency decomposition
-        let components = self.analyzer.decompose(&values)?;
+        let mut components = self.analyzer.decompose(&values)?;
 
         // Filter components based on tier's frequency band
         if let Some((low_freq, high_freq)) = self.config.tier_frequency_bands.get(&self.tier) {
-            self.components = components
-                .into_iter()
-                .filter(|c| c.frequency >= *low_freq && c.frequency <= *high_freq)
-                .collect();
+            components.retain(|c| c.frequency >= *low_freq && c.frequency <= *high_freq);
         }
 
-        // Broadcast new components to peers
+        // Refine components using wavelet information
+        if let Some(ref wavelet) = self.wavelet_decomp {
+            self.refine_components(&mut components, wavelet);
+        }
+
+        self.components = components;
+
+        // Calculate current phase coherence
+        let coherence = self.phase_space.as_ref().map_or(0.0, |ps| ps.coherence);
+
+        // Broadcast state to peers
         let heartbeat = Message::Heartbeat {
             node_id: self.node_id.clone(),
             tier: self.tier,
@@ -152,9 +175,49 @@ impl SyncManager {
         Ok(())
     }
 
-    /// Calculates current precision based on component stability
+    /// Refines frequency components using wavelet information
+    fn refine_components(&self, components: &mut Vec<FrequencyComponent>, wavelet: &WaveletDecomposition) {
+        for component in components.iter_mut() {
+            // Find closest wavelet scale
+            if let Some(scale_idx) = wavelet.frequencies.iter()
+                .position(|&f| (f - component.frequency).abs() < 0.1)
+            {
+                // Use wavelet coefficients to refine amplitude and phase
+                let coeffs = &wavelet.coefficients[scale_idx];
+                let mean_coeff = coeffs.iter()
+                    .map(|c| c.norm())
+                    .sum::<f64>() / coeffs.len() as f64;
+                
+                // Adjust amplitude based on wavelet energy
+                component.amplitude *= Complex64::new(mean_coeff, 0.0);
+            }
+        }
+    }
+
+    /// Calculates current precision based on multiple metrics
     pub fn calculate_precision(&self) -> Precision {
-        self.analyzer.calculate_precision(&self.components)
+        // Get phase space coherence
+        let phase_coherence = self.phase_space
+            .as_ref()
+            .map(|ps| ps.coherence)
+            .unwrap_or(0.0);
+
+        // Calculate peer-averaged coherence
+        let peer_coherence = if !self.peer_coherence.is_empty() {
+            self.peer_coherence.values().sum::<f64>() / self.peer_coherence.len() as f64
+        } else {
+            0.0
+        };
+
+        // Calculate combined precision using all metrics
+        self.analyzer.calculate_precision(
+            &self.components,
+            self.phase_space.as_ref().unwrap_or(&PhaseSpace {
+                coordinates: Vec::new(),
+                timestamps: Vec::new(),
+                coherence: 0.0,
+            })
+        )
     }
 
     /// Synthesizes timing signal from current components
@@ -182,6 +245,7 @@ impl SyncManager {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use std::f64::consts::PI;
 
     #[tokio::test]
     async fn test_sample_analysis() {
@@ -191,7 +255,7 @@ mod tests {
         let mut manager = SyncManager::new(
             node_id.clone(),
             Tier::base(),
-            config,
+            config.clone(),
             tx,
         );
 
@@ -201,8 +265,7 @@ mod tests {
         
         for i in 0..config.min_samples {
             let time = SystemTime::now();
-            let value = (2.0 * std::f64::consts::PI * freq * i as f64 
-                / config.sample_rate).sin();
+            let value = (2.0 * PI * freq * i as f64 / config.sample_rate).sin();
             manager.add_sample(time, value);
         }
 
@@ -220,5 +283,64 @@ mod tests {
         } else {
             panic!("Expected heartbeat message");
         }
+    }
+
+    #[tokio::test]
+    async fn test_phase_coherence() {
+        let (tx, _rx) = mpsc::channel(32);
+        let node_id = NodeId::random();
+        let config = SyncConfig::default();
+        let mut manager = SyncManager::new(
+            node_id.clone(),
+            Tier::base(),
+            config.clone(),
+            tx,
+        );
+
+        // Add coherent samples (perfect sine wave)
+        let freq = 0.5;
+        for i in 0..config.min_samples {
+            let time = SystemTime::now();
+            let value = (2.0 * PI * freq * i as f64 / config.sample_rate).sin();
+            manager.add_sample(time, value);
+        }
+
+        // Analyze and check phase coherence
+        manager.analyze().await.unwrap();
+        assert!(manager.phase_space.is_some());
+        let coherence = manager.phase_space.as_ref().unwrap().coherence;
+        assert!(coherence > 0.9, "Expected high phase coherence for perfect sine wave");
+    }
+
+    #[tokio::test]
+    async fn test_wavelet_refinement() {
+        let (tx, _rx) = mpsc::channel(32);
+        let node_id = NodeId::random();
+        let config = SyncConfig::default();
+        let mut manager = SyncManager::new(
+            node_id.clone(),
+            Tier::base(),
+            config.clone(),
+            tx,
+        );
+
+        // Add multi-frequency signal
+        let freq1 = 0.5;
+        let freq2 = 0.7;
+        for i in 0..config.min_samples {
+            let time = SystemTime::now();
+            let t = i as f64 / config.sample_rate;
+            let value = (2.0 * PI * freq1 * t).sin() + 0.5 * (2.0 * PI * freq2 * t).sin();
+            manager.add_sample(time, value);
+        }
+
+        // Analyze and check wavelet decomposition
+        manager.analyze().await.unwrap();
+        assert!(manager.wavelet_decomp.is_some());
+        
+        // Should detect both frequencies
+        let components = &manager.components;
+        assert!(components.iter().any(|c| (c.frequency - freq1).abs() < 0.1));
+        assert!(components.iter().any(|c| (c.frequency - freq2).abs() < 0.1));
     }
 }

@@ -33,12 +33,45 @@ struct Inner {
     recv_buffer: BytesMut,
 }
 
+impl Default for Inner {
+    fn default() -> Self {
+        let (_, rx) = mpsc::channel(32);
+        Inner {
+            codec: MessageCodec::new(),
+            message_rx: rx,
+            recv_buffer: BytesMut::with_capacity(8192),
+        }
+    }
+}
+
 /// Manages network connections and message routing
 pub struct ConnectionManager {
     /// Shared state
     shared: Arc<SharedState>,
-    /// Inner state
+    /// Inner mutable state
     inner: Inner,
+}
+
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        // Create a runtime for socket initialization
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let socket = rt.block_on(async {
+            UdpSocket::bind("127.0.0.1:0").await.unwrap()
+        });
+        
+        let (tx, _) = mpsc::channel(32);
+        let shared = Arc::new(SharedState {
+            node_id: NodeId::random(),
+            socket: Arc::new(socket),
+            message_tx: tx,
+        });
+
+        ConnectionManager {
+            shared,
+            inner: Inner::default(),
+        }
+    }
 }
 
 impl ConnectionManager {

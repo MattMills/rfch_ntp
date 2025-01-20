@@ -1,8 +1,31 @@
 use num_complex::Complex64;
 use rustfft::FftPlanner;
 use std::time::SystemTime;
+use nalgebra::{Complex, DMatrix};
 
 use crate::core::{Error, Result, FrequencyComponent, Precision};
+
+/// Phase space representation of a signal
+#[derive(Debug, Clone)]
+pub struct PhaseSpace {
+    /// Complex coordinates in phase space
+    pub coordinates: Vec<Complex<f64>>,
+    /// Time points
+    pub timestamps: Vec<SystemTime>,
+    /// Phase coherence metric
+    pub coherence: f64,
+}
+
+/// Wavelet decomposition of a signal
+#[derive(Debug, Clone)]
+pub struct WaveletDecomposition {
+    /// Wavelet coefficients at different scales
+    pub coefficients: Vec<Vec<Complex<f64>>>,
+    /// Scale parameters
+    pub scales: Vec<f64>,
+    /// Center frequencies for each scale
+    pub frequencies: Vec<f64>,
+}
 
 /// Frequency analyzer for decomposing and analyzing timing signals
 pub struct FrequencyAnalyzer {
@@ -12,6 +35,12 @@ pub struct FrequencyAnalyzer {
     sample_rate: f64,
     /// Window size for FFT
     window_size: usize,
+    /// Mother wavelet parameters
+    wavelet_width: f64,
+    /// Phase space dimension
+    embedding_dim: usize,
+    /// Phase space delay
+    embedding_delay: usize,
 }
 
 impl FrequencyAnalyzer {
@@ -21,7 +50,112 @@ impl FrequencyAnalyzer {
             fft_planner: FftPlanner::new(),
             sample_rate,
             window_size,
+            wavelet_width: 6.0,
+            embedding_dim: 3,
+            embedding_delay: 1,
         }
+    }
+
+    /// Performs wavelet transform on the input signal
+    pub fn wavelet_transform(&self, samples: &[f64]) -> Result<WaveletDecomposition> {
+        let n_samples = samples.len();
+        let mut scales = Vec::new();
+        let mut frequencies = Vec::new();
+        let mut coefficients = Vec::new();
+
+        // Generate logarithmically spaced scales
+        let n_scales = 32;
+        let min_scale = 2.0;
+        let max_scale = n_samples as f64 / 6.0;
+        let scale_step = (max_scale / min_scale).powf(1.0 / (n_scales as f64 - 1.0));
+
+        let mut scale = min_scale;
+        for _ in 0..n_scales {
+            scales.push(scale);
+            frequencies.push(self.sample_rate / (scale * 2.0 * std::f64::consts::PI));
+            scale *= scale_step;
+        }
+
+        // Compute wavelet coefficients for each scale
+        for scale in &scales {
+            let mut scale_coeffs = Vec::with_capacity(n_samples);
+            
+            for t in 0..n_samples {
+                let mut sum = Complex::new(0.0, 0.0);
+                
+                for i in 0..n_samples {
+                    let t_scaled = (i as f64 - t as f64) / scale;
+                    // Morlet wavelet
+                    let wavelet = (-t_scaled * t_scaled / (2.0 * self.wavelet_width))
+                        .exp() * (self.wavelet_width * t_scaled * Complex::i()).exp();
+                    sum += Complex::new(samples[i], 0.0) * wavelet;
+                }
+                
+                scale_coeffs.push(sum / scale.sqrt());
+            }
+            
+            coefficients.push(scale_coeffs);
+        }
+
+        Ok(WaveletDecomposition {
+            coefficients,
+            scales,
+            frequencies,
+        })
+    }
+
+    /// Maps signal to phase space using delay embedding
+    pub fn phase_space_mapping(&self, samples: &[f64], timestamps: &[SystemTime]) -> Result<PhaseSpace> {
+        if samples.len() != timestamps.len() {
+            return Err(Error::frequency_analysis(
+                "Sample and timestamp counts must match"
+            ));
+        }
+
+        let n_points = samples.len() - (self.embedding_dim - 1) * self.embedding_delay;
+        let mut coordinates = Vec::with_capacity(n_points);
+        let mut embedded_timestamps = Vec::with_capacity(n_points);
+
+        // Construct delay vectors
+        for i in 0..n_points {
+            let mut coord = Complex::new(samples[i], 0.0);
+            for d in 1..self.embedding_dim {
+                let delay_idx = i + d * self.embedding_delay;
+                coord += Complex::new(samples[delay_idx], 0.0) 
+                    * Complex::i().powf(d as f64);
+            }
+            coordinates.push(coord);
+            embedded_timestamps.push(timestamps[i]);
+        }
+
+        // Calculate phase coherence
+        let coherence = self.calculate_phase_coherence(&coordinates);
+
+        Ok(PhaseSpace {
+            coordinates,
+            timestamps: embedded_timestamps,
+            coherence,
+        })
+    }
+
+    /// Calculates phase coherence metric
+    fn calculate_phase_coherence(&self, coordinates: &[Complex<f64>]) -> f64 {
+        let n = coordinates.len();
+        if n < 2 {
+            return 0.0;
+        }
+
+        // Calculate phase differences
+        let phase_diffs: Vec<f64> = coordinates.windows(2)
+            .map(|w| (w[1] / w[0]).arg())
+            .collect();
+
+        // Calculate order parameter
+        let sum = phase_diffs.iter()
+            .map(|&phi| Complex::new(phi.cos(), phi.sin()))
+            .sum::<Complex<f64>>();
+
+        sum.norm() / n as f64
     }
 
     /// Decomposes a time series into frequency components
@@ -89,16 +223,19 @@ impl FrequencyAnalyzer {
         Ok(components)
     }
 
-    /// Calculates precision based on frequency component stability
-    pub fn calculate_precision(&self, components: &[FrequencyComponent]) -> Precision {
-        // Simple precision metric based on component count and amplitude stability
-        let component_count = components.len() as u32;
-        let amplitude_sum: f64 = components.iter()
+    /// Calculates precision based on frequency component stability and phase coherence
+    pub fn calculate_precision(&self, components: &[FrequencyComponent], phase_space: &PhaseSpace) -> Precision {
+        // Component-based precision
+        let component_count = components.len() as f64;
+        let amplitude_stability: f64 = components.iter()
             .map(|c| c.amplitude.norm())
             .sum();
 
-        // Scale precision based on component count and amplitude strength
-        let precision_value = (component_count as f64 * amplitude_sum)
+        // Phase coherence contribution
+        let coherence_factor = phase_space.coherence;
+
+        // Combined precision metric
+        let precision_value = (component_count * amplitude_stability * coherence_factor)
             .min(1000.0) as u32;
 
         Precision(precision_value)

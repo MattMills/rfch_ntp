@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::SystemTimeError};
 use thiserror::Error;
 
 /// Custom error types for RFCH NTP
@@ -37,6 +37,12 @@ pub enum Error {
 
 /// Result type alias using our custom Error type
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<SystemTimeError> for Error {
+    fn from(err: SystemTimeError) -> Self {
+        Error::Timing(err.to_string())
+    }
+}
 
 impl Error {
     /// Creates a new protocol error

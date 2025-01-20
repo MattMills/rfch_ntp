@@ -27,6 +27,16 @@ impl Tier {
             None
         }
     }
+
+    /// Returns the tier level
+    pub fn level(&self) -> u8 {
+        self.0
+    }
+
+    /// Creates a tier from precision level
+    pub fn from_precision(precision: &Precision) -> Self {
+        Tier((precision.0 / 1000) as u8)
+    }
 }
 
 /// Node identifier in the network

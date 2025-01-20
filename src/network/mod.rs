@@ -73,8 +73,8 @@ impl NetworkManager {
         // Take ownership of connection
         let mut connection = std::mem::replace(
             &mut self.connection,
-            // We'll never use this temporary value
-            unsafe { std::mem::zeroed() }
+            // Use a default value since we'll never use this temporary value
+            ConnectionManager::default()
         );
 
         // Spawn discovery task
