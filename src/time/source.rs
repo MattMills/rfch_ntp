@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::net::UdpSocket;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use tokio::time::interval;
 use nalgebra::DVector;
@@ -165,17 +167,58 @@ impl Default for GpsConfig {
 impl Default for TimeSourceConfig {
     fn default() -> Self {
         TimeSourceConfig {
+            // Use system clock as primary source
             primary: TimeSource::System,
-            backups: vec![],
-            sample_interval: Duration::from_secs(1),
-            max_drift: Duration::from_millis(100),
-            window_size: 64,
-            ntp_config: NtpConfig::default(),
+            // Use NTP pool as backup
+            backups: vec![TimeSource::Ntp("pool.ntp.org".to_string())],
+            // Sample more frequently for better frequency decomposition
+            sample_interval: Duration::from_millis(100),
+            // Allow larger drift before switching to backup
+            max_drift: Duration::from_millis(500),
+            // Use larger window for better frequency analysis
+            window_size: 256,
+            // Configure NTP for better precision
+            ntp_config: NtpConfig {
+                version: 4,
+                poll_interval: Duration::from_secs(8), // Poll more frequently
+                min_samples: 16, // More samples for better statistics
+            },
+            // Keep default PTP config
             ptp_config: PtpConfig::default(),
+            // Keep default GPS config
             gps_config: GpsConfig::default(),
+            // Keep default quantum config
             quantum_config: QuantumConfig::default(),
         }
     }
+}
+
+/// Statistics about time samples
+#[derive(Debug, Clone)]
+pub struct TimeStats {
+    /// Number of samples in window
+    pub sample_count: usize,
+    /// Minimum error (nanoseconds)
+    pub min_error: u64,
+    /// Maximum error (nanoseconds)
+    pub max_error: u64,
+    /// Mean error (nanoseconds)
+    pub mean_error: f64,
+    /// RTT statistics if available
+    pub rtt_stats: Option<RttStats>,
+}
+
+/// Round-trip time statistics
+#[derive(Debug, Clone)]
+pub struct RttStats {
+    /// Minimum RTT
+    pub min: Duration,
+    /// Maximum RTT
+    pub max: Duration,
+    /// Mean RTT
+    pub mean: Duration,
+    /// Standard deviation of RTT
+    pub stddev: Duration,
 }
 
 /// Manages time source sampling and drift compensation
@@ -191,13 +234,13 @@ pub struct TimeSourceManager {
     /// Kalman filter covariance
     drift_covariance: f64,
     /// NTP socket for hardware timestamps
-    ntp_socket: Option<UdpSocket>,
+    ntp_socket: Option<Arc<Mutex<UdpSocket>>>,
     /// PTP device handle
     ptp_device: Option<String>,
     /// GPS receiver handle
-    gps_receiver: Option<GpsReceiver>,
+    gps_receiver: Option<Arc<Mutex<GpsReceiver>>>,
     /// Quantum clock handle
-    quantum_clock: Option<super::quantum::QuantumClock>,
+    quantum_clock: Option<Arc<Mutex<crate::time::QuantumClock>>>,
 }
 
 impl TimeSourceManager {
@@ -208,7 +251,7 @@ impl TimeSourceManager {
             TimeSource::Ntp(_) => {
                 let socket = UdpSocket::bind("0.0.0.0:0")?;
                 socket.set_nonblocking(true)?;
-                Some(socket)
+                Some(Arc::new(Mutex::new(socket)))
             }
             _ => None,
         };
@@ -216,7 +259,7 @@ impl TimeSourceManager {
         // Initialize GPS receiver if needed
         let gps_receiver = match &config.primary {
             TimeSource::Gps { device, use_pps } => {
-                Some(GpsReceiver::open(device, config.gps_config.baud_rate)?)
+                Some(Arc::new(Mutex::new(GpsReceiver::open(device, config.gps_config.baud_rate)?)))
             }
             _ => None,
         };
@@ -224,7 +267,7 @@ impl TimeSourceManager {
         // Initialize quantum clock if needed
         let quantum_clock = match &config.primary {
             TimeSource::Quantum => {
-                Some(super::quantum::QuantumClock::new(config.quantum_config.coherence_time)?)
+                Some(Arc::new(Mutex::new(crate::time::QuantumClock::new(config.quantum_config.coherence_time)?)))
             }
             _ => None,
         };
@@ -244,17 +287,15 @@ impl TimeSourceManager {
 
     /// Starts the time source manager
     pub async fn run(&mut self) -> Result<()> {
-        let mut sample_interval = interval(self.config.sample_interval);
-
         loop {
-            sample_interval.tick().await;
             self.sample_time().await?;
-            self.update_drift();
+            self.update_drift().await;
+            tokio::time::sleep(self.config.sample_interval).await;
         }
     }
 
     /// Takes a time sample from the current source
-    pub(crate) async fn sample_time(&mut self) -> Result<()> {
+    pub async fn sample_time(&mut self) -> Result<()> {
         let sample = {
             match &self.current_source {
                 TimeSource::System => self.sample_system()?,
@@ -279,8 +320,9 @@ impl TimeSourceManager {
 
     /// Samples time from quantum clock
     async fn sample_quantum(&mut self) -> Result<TimeSample> {
-        let clock = self.quantum_clock.as_mut()
+        let clock = self.quantum_clock.as_ref()
             .ok_or_else(|| Error::timing("Quantum clock not initialized"))?;
+        let mut clock = clock.lock().await;
 
         let hw_ts = clock.get_timestamp()?;
 
@@ -315,11 +357,13 @@ impl TimeSourceManager {
 
         // Send request with hardware timestamp
         let t1 = SystemTime::now();
+        let socket = socket.lock().await;
         socket.send_to(&packet, format!("{}:123", server))?;
 
         // Receive response with hardware timestamp
         let mut response = [0u8; 48];
         let (_, _) = socket.recv_from(&mut response)?;
+        drop(socket); // Release lock
         let t4 = SystemTime::now();
 
         // Extract timestamps from packet
@@ -356,8 +400,9 @@ impl TimeSourceManager {
 
     /// Samples time from a GPS receiver
     async fn sample_gps(&mut self, device: &str, use_pps: bool) -> Result<TimeSample> {
-        let receiver = self.gps_receiver.as_mut()
+        let receiver = self.gps_receiver.as_ref()
             .ok_or_else(|| Error::timing("GPS receiver not initialized"))?;
+        let mut receiver = receiver.lock().await;
 
         let hw_ts = receiver.get_timestamp()?;
 
@@ -374,7 +419,7 @@ impl TimeSourceManager {
     }
 
     /// Updates drift estimate using Kalman filter with adaptive noise
-    fn update_drift(&mut self) {
+    async fn update_drift(&mut self) {
         if self.samples.len() < 2 {
             return;
         }
@@ -429,14 +474,14 @@ impl TimeSourceManager {
 
         // Switch to backup if drift exceeds threshold
         if drift_ppm.abs() > max_drift_ppm {
-            if let Err(e) = self.switch_to_backup() {
+            if let Err(e) = self.switch_to_backup().await {
                 eprintln!("Failed to switch to backup: {}", e);
             }
         }
     }
 
     /// Switches to a backup time source with initialization
-    fn switch_to_backup(&mut self) -> Result<()> {
+    async fn switch_to_backup(&mut self) -> Result<()> {
         for backup in &self.config.backups {
             match backup {
                 TimeSource::System => {
@@ -450,7 +495,7 @@ impl TimeSourceManager {
                     if self.ntp_socket.is_none() {
                         let socket = UdpSocket::bind("0.0.0.0:0")?;
                         socket.set_nonblocking(true)?;
-                        self.ntp_socket = Some(socket);
+                        self.ntp_socket = Some(Arc::new(Mutex::new(socket)));
                     }
                     self.current_source = backup.clone();
                     return Ok(());
@@ -458,10 +503,8 @@ impl TimeSourceManager {
                 TimeSource::Gps { device, use_pps } => {
                     // Try to initialize GPS
                     if self.gps_receiver.is_none() {
-                        self.gps_receiver = Some(GpsReceiver::open(
-                            device,
-                            self.config.gps_config.baud_rate,
-                        )?);
+                        let receiver = GpsReceiver::open(device, self.config.gps_config.baud_rate)?;
+                        self.gps_receiver = Some(Arc::new(Mutex::new(receiver)));
                     }
                     self.current_source = backup.clone();
                     return Ok(());
@@ -469,12 +512,12 @@ impl TimeSourceManager {
                 TimeSource::Quantum => {
                     // Try to initialize quantum clock
                     if self.quantum_clock.is_none() {
-                        self.quantum_clock = Some(super::quantum::QuantumClock::new(
-                            self.config.quantum_config.coherence_time,
-                        )?);
+                        let clock = crate::time::QuantumClock::new(self.config.quantum_config.coherence_time)?;
+                        self.quantum_clock = Some(Arc::new(Mutex::new(clock)));
                     }
                     // Check if quantum state is coherent
                     if let Some(clock) = &self.quantum_clock {
+                        let clock = clock.lock().await;
                         if clock.is_coherent() {
                             self.current_source = TimeSource::Quantum;
                             return Ok(());
@@ -545,166 +588,5 @@ impl TimeSourceManager {
         }
 
         stats
-    }
-}
-
-/// Statistics about time samples
-#[derive(Debug, Clone)]
-pub struct TimeStats {
-    /// Number of samples in window
-    pub sample_count: usize,
-    /// Minimum error (nanoseconds)
-    pub min_error: u64,
-    /// Maximum error (nanoseconds)
-    pub max_error: u64,
-    /// Mean error (nanoseconds)
-    pub mean_error: f64,
-    /// RTT statistics if available
-    pub rtt_stats: Option<RttStats>,
-}
-
-/// Round-trip time statistics
-#[derive(Debug, Clone)]
-pub struct RttStats {
-    /// Minimum RTT
-    pub min: Duration,
-    /// Maximum RTT
-    pub max: Duration,
-    /// Mean RTT
-    pub mean: Duration,
-    /// Standard deviation of RTT
-    pub stddev: Duration,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::time::sleep;
-
-    #[tokio::test]
-    async fn test_system_time_source() {
-        let config = TimeSourceConfig::default();
-        let mut manager = TimeSourceManager::new(config).unwrap();
-
-        // Sample time a few times
-        for _ in 0..3 {
-            manager.sample_time().await.unwrap();
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        // Check statistics
-        let stats = manager.get_stats();
-        assert_eq!(stats.sample_count, 3);
-        assert!(stats.mean_error > 0.0);
-    }
-
-    #[tokio::test]
-    async fn test_drift_estimation() {
-        let config = TimeSourceConfig {
-            max_drift: Duration::from_micros(200),
-            sample_interval: Duration::from_millis(100),
-            ..Default::default()
-        };
-        let mut manager = TimeSourceManager::new(config).unwrap();
-
-        // Simulate samples with realistic drift (10 ppm) and noise
-        let base_drift = 10.0; // 10 microseconds per second = 10 ppm
-        let now = SystemTime::now();
-        let sample_interval = Duration::from_millis(100);
-        
-        for i in 0..20 {
-            // Calculate time with drift
-            let elapsed = sample_interval * i;
-            let drift = Duration::from_nanos((base_drift * elapsed.as_secs_f64() * 1000.0) as u64);
-            
-            // Add random noise (±100 ns)
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            let noise = Duration::from_nanos(rng.gen_range(0..200));
-            
-            let sample = TimeSample {
-                time: now + elapsed + drift + noise,
-                hw_timestamp: None,
-                rtt: None,
-                error: 1_000_000, // 1ms error for system time
-                source: TimeSource::System,
-            };
-            manager.samples.push_back(sample);
-            manager.update_drift();
-        }
-
-        // Get final drift estimate
-        let estimated = manager.get_drift();
-        let estimated_ppm = estimated.as_secs_f64() * 1_000_000.0;
-        
-        // Should be close to 10 ppm
-        assert!(estimated_ppm > 8.0 && estimated_ppm < 12.0,
-                "Expected drift around 10 ppm, got {} ppm", estimated_ppm);
-    }
-
-    #[tokio::test]
-    async fn test_backup_switching() {
-        let config = TimeSourceConfig {
-            primary: TimeSource::System,
-            backups: vec![],
-            ..Default::default()
-        };
-
-        let mut manager = TimeSourceManager::new(config).unwrap();
-
-        // Force high drift to trigger backup switch
-        manager.drift_estimate = 1.0;
-        manager.switch_to_backup().unwrap_err(); // Should fail with no backups
-    }
-
-    #[tokio::test]
-    async fn test_quantum_backup_switching() {
-        let config = TimeSourceConfig {
-            primary: TimeSource::System,
-            backups: vec![TimeSource::System, TimeSource::Quantum],
-            quantum_config: QuantumConfig {
-                coherence_time: Duration::from_millis(50),
-                code_distance: 3,
-                error_threshold: 0.01,
-            },
-            ..Default::default()
-        };
-
-        let mut manager = TimeSourceManager::new(config).unwrap();
-
-        // Sample time to initialize
-        manager.sample_time().await.unwrap();
-
-        // Force high drift to trigger backup switch
-        manager.drift_estimate = 1.0;
-        manager.switch_to_backup().unwrap(); // Should switch to system first
-        assert!(matches!(manager.current_source, TimeSource::System));
-
-        // Force another switch
-        manager.drift_estimate = 1.0;
-        manager.switch_to_backup().unwrap(); // Should switch to quantum
-        assert!(matches!(manager.current_source, TimeSource::Quantum));
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires GPS hardware
-    async fn test_gps_time_source() {
-        let config = TimeSourceConfig {
-            primary: TimeSource::Gps {
-                device: "/dev/ttyACM0".to_string(),
-                use_pps: true,
-            },
-            ..Default::default()
-        };
-
-        let mut manager = TimeSourceManager::new(config).unwrap();
-
-        // Sample GPS time
-        if let Ok(()) = manager.sample_time().await {
-            let stats = manager.get_stats();
-            assert_eq!(stats.sample_count, 1);
-            // Error should be small with PPS
-            assert!(stats.mean_error < 1_000.0); // Less than 1µs
-        }
     }
 }

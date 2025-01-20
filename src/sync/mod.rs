@@ -18,7 +18,7 @@ pub mod frequency;
 pub mod sync_manager;
 pub mod optimizer;
 
-pub use self::frequency::FrequencyAnalyzer;
+pub use self::frequency::{FrequencyAnalyzer, PhaseSpace, WaveletDecomposition};
 pub use self::sync_manager::{SyncManager, SyncConfig};
 pub use self::optimizer::TierOptimizer;
 

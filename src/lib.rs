@@ -8,7 +8,7 @@ pub mod core;
 // These modules will be implemented incrementally
 mod network;
 mod protocol;
-mod sync;
+pub mod sync;  // Make sync module public
 pub mod time;
 mod util;
 
