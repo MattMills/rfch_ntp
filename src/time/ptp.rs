@@ -86,7 +86,7 @@ impl PtpClock {
 
         // Configure hardware timestamping
         unsafe {
-            if ioctl::ioctl(device.as_raw_fd(), SIOCSHWTSTAMP, &mut ts_config as *mut _) < 0 {
+            if unsafe { libc::ioctl(device.as_raw_fd(), SIOCSHWTSTAMP, &mut ts_config as *mut _) } < 0 {
                 return Err(Error::timing("Failed to configure hardware timestamping"));
             }
         }
@@ -129,7 +129,7 @@ impl PtpClock {
         };
 
         unsafe {
-            if ioctl::ioctl(self.device.as_raw_fd(), SIOCGHWTSTAMP, &mut ts as *mut _) < 0 {
+            if unsafe { libc::ioctl(self.device.as_raw_fd(), SIOCGHWTSTAMP, &mut ts as *mut _) } < 0 {
                 return Err(Error::timing("Failed to read hardware timestamp"));
             }
         }
