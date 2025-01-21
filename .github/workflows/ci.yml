@@ -17,6 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
+
       - name: Cache Rust dependencies
         uses: actions/cache@v3
         with:
@@ -54,6 +59,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
 
       - name: Cache Rust dependencies
         uses: actions/cache@v3
@@ -101,6 +111,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
 
       - name: Cache Rust dependencies
         uses: actions/cache@v3
