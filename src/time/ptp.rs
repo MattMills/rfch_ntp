@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
 use nix::{
-    ioctl,
+    sys::ioctl,
     sys::{
         socket::{socket, AddressFamily, SockFlag, SockType, SockProtocol},
         time::TimeSpec,

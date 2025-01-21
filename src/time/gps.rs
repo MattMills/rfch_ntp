@@ -68,7 +68,7 @@ impl GpsReceiver {
             };
 
             unsafe {
-                if ioctl::ioctl(pps.as_raw_fd(), PPS_SETPARAMS, &mut caps as *mut _) < 0 {
+                if unsafe { libc::ioctl(pps.as_raw_fd(), PPS_SETPARAMS, &mut caps as *mut _) } < 0 {
                     return Err(Error::timing("Failed to configure PPS device"));
                 }
             }
@@ -197,7 +197,7 @@ impl GpsReceiver {
             };
 
             unsafe {
-                if ioctl::ioctl(pps.as_raw_fd(), PPS_GETTIME, &mut event as *mut _) >= 0 {
+                if unsafe { libc::ioctl(pps.as_raw_fd(), PPS_GETTIME, &mut event as *mut _) } >= 0 {
                     let ts = SystemTime::UNIX_EPOCH + Duration::new(
                         event.assert_tu.tv_sec() as u64,
                         event.assert_tu.tv_nsec() as u32,
