@@ -34,17 +34,12 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --release --all-features
+        run: cargo build --release --all-features
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v3
@@ -77,33 +72,20 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Run tests
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --all-features --no-fail-fast
-        env:
-          RUST_LOG: debug
-        continue-on-error: false
-
-      - name: Generate test report
-        if: always()
         run: |
-          cargo install cargo2junit
-          cargo test --all-features -- -Z unstable-options --format json | cargo2junit > junit.xml
+          RUST_LOG=debug cargo test --all-features --no-fail-fast 2>&1 | tee test-output.log
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v3
         with:
           name: test-results
-          path: junit.xml
+          path: test-output.log
 
   examples:
     name: Run Examples
@@ -129,11 +111,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Create examples log directory
         run: mkdir -p example-logs
